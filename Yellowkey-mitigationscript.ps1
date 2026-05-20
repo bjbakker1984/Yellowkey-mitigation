@@ -173,7 +173,7 @@ $changeApplied  = $false
 $mounted        = $false
 $hiveLoaded     = $false
 
-$timeout = 10 # timeout between externalCommand executions, to give the system some time to release handles.
+$timeout = 5 # timeout between externalCommand executions, to give the system some time to release handles.
 
 $ErrorActionPreference = 'SilentlyContinue'
   
@@ -320,6 +320,8 @@ try {
         throw "Step 3 failed. A change appeared necessary but no ControlSet was successfully updated."
     }
 
+    [gc]::collect() #free up all powershell handles before continuing
+    Start-Sleep $timeout
     # Step 4: Unload the hive
     $res4 = Invoke-ExternalCommand -FilePath 'reg.exe' -ArgumentList @('unload', "HKLM\$HiveName")
     if ($res4.ExitCode -ne 0) {
