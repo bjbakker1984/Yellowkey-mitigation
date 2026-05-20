@@ -1,4 +1,4 @@
-﻿#requires -RunAsAdministrator
+#requires -RunAsAdministrator
 [CmdletBinding()]
 param(
     [string]$MountPath = 'C:\mountYellowkeyFix',
@@ -173,6 +173,16 @@ $changeApplied  = $false
 $mounted        = $false
 $hiveLoaded     = $false
 
+$timeout = 10 # timeout between externalCommand executions, to give the system some time to release handles.
+
+$ErrorActionPreference = 'SilentlyContinue'
+  
+#these can throw errors but are ignored. Only relevant if testing has been done / multiple runs are done because of intermittend stops in previous runs  
+    Unload-HiveIfLoaded -HiveName $HiveName
+    $firstCleanup = & reagentc.exe /unmountre /path $MountPath /discard  
+
+$ErrorActionPreference = 'Stop'
+
 # -----------------------------
 # Main execution
 # -----------------------------
@@ -183,8 +193,10 @@ try {
         throw "Windows RE is not enabled before start. Current state: $($preInfo.Raw)"
     }
 
+    Start-Sleep $timeout
     # Step 1: Mount the WinRE image
     Ensure-EmptyMountDirectory -Path $MountPath
+
     $res1 = Invoke-ExternalCommand -FilePath 'reagentc.exe' -ArgumentList @('/mountre', '/path', $MountPath)
     if ($res1.ExitCode -ne 0) {
         throw "Step 1 failed. ExitCode=$($res1.ExitCode). Output: $($res1.Output)"
@@ -197,7 +209,7 @@ try {
     $step1Succeeded = $true
     $mounted = $true
     Add-SummaryStep -StepNumber 1 -StepName 'Mount WinRE image' -Status 'Success' -Details "Mounted to '$MountPath'."
-
+   
     # Step 2: Load the mounted SYSTEM hive
     $res2 = Invoke-ExternalCommand -FilePath 'reg.exe' -ArgumentList @('load', "HKLM\$HiveName", $hiveFile)
     if ($res2.ExitCode -ne 0) {
@@ -322,6 +334,7 @@ try {
     $step4Succeeded = $true
     Add-SummaryStep -StepNumber 4 -StepName 'Unload offline hive' -Status 'Success' -Details "Unloaded HKLM\$HiveName."
 
+    Start-Sleep $timeout
     # Step 5: Unmount WinRE image
     if ($changeApplied) {
         $res5 = Invoke-ExternalCommand -FilePath 'reagentc.exe' -ArgumentList @('/unmountre', '/path', $MountPath, '/commit')
@@ -344,13 +357,14 @@ try {
     $step5Succeeded = $true
     Add-SummaryStep -StepNumber 5 -StepName 'Unmount WinRE image' -Status 'Success' -Changed $changeApplied -Details "Unmounted using /$mode."
 
+    Start-Sleep $timeout
     # Step 6: Re-establish BitLocker trust only if all previous steps succeeded AND a change was actually applied
     if ($step1Succeeded -and $step2Succeeded -and $step3Succeeded -and $step4Succeeded -and $step5Succeeded -and $changeApplied) {
         $res6a = Invoke-ExternalCommand -FilePath 'reagentc.exe' -ArgumentList @('/disable')
         if ($res6a.ExitCode -ne 0) {
             throw "Step 6 (/disable) failed. ExitCode=$($res6a.ExitCode). Output: $($res6a.Output)"
         }
-
+        Start-Sleep $timeout
         $midInfo = Get-ReAgentStatus
         if ($midInfo.Enabled -ne $false) {
             throw "Step 6 verification failed after /disable. Windows RE did not report Disabled."
@@ -360,7 +374,7 @@ try {
         if ($res6b.ExitCode -ne 0) {
             throw "Step 6 (/enable) failed. ExitCode=$($res6b.ExitCode). Output: $($res6b.Output)"
         }
-
+        Start-Sleep $timeout
         $postInfo = Get-ReAgentStatus
         if ($postInfo.Enabled -ne $true) {
             throw "Step 6 verification failed after /enable. Windows RE did not report Enabled."
@@ -398,7 +412,7 @@ catch {
             $err += " | Cleanup warning: unable to unload hive: $($_.Exception.Message)"
         }
     }
-
+    Start-Sleep $timeout
     if ($mounted) {
         try {
             $cleanupUnmount = Unmount-WinREBestEffort -MountPath $MountPath
@@ -411,9 +425,36 @@ catch {
             $err += " | Cleanup warning: unable to unmount WinRE: $($_.Exception.Message)"
         }
     }
+    
+    Start-Sleep $timeout
+    
+    #retry clean-up executions an extra time just to be sure no lingering mounts/openhandles are left behind
+    try {
+            $cleanupHive = Unload-HiveIfLoaded -HiveName $HiveName
+            if ($cleanupHive -and $cleanupHive.ExitCode -ne 0) {
+                $err += " | Cleanup warning: reg unload failed with ExitCode=$($cleanupHive.ExitCode). Output: $($cleanupHive.Output)"
+            }
+            $hiveLoaded = $false
+        }
+        catch {
+            $err += " | Cleanup warning: unable to unload hive: $($_.Exception.Message)"
+        }
+    Start-Sleep $timeout
+    try {
+            $cleanupUnmount = Unmount-WinREBestEffort -MountPath $MountPath -Commit $FALSE
+            if ($cleanupUnmount.ExitCode -ne 0) {
+                $err += " | Cleanup warning: unmount/discard failed with ExitCode=$($cleanupUnmount.ExitCode). Output: $($cleanupUnmount.Output)"
+            }
+            $mounted = $false
+        }
+        catch {
+            $err += " | Cleanup warning: unable to unmount WinRE: $($_.Exception.Message)"
+        }
+    Start-Sleep $timeout
 
     # Add failure summary for the current phase if not already obvious from prior entries
     Add-SummaryStep -StepNumber 99 -StepName 'Execution result' -Status 'Failed' -Changed $changeApplied -Details $err
+
 }
 finally {
     # Step 7: Create summary
